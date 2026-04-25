@@ -37,14 +37,18 @@ export async function exportToXlsx(
         header: [
             "Object_ID", "Label",
             "Layout_X", "Layout_Y", "Layout_W", "Layout_H",
-            "Polygon_Points", "Image_URL",
+            "Polygon_Points",
+            "Canvas_W", "Canvas_H",
+            "Image_URL",
         ],
     });
     // Column widths
     ws["!cols"] = [
         { wch: 14 }, { wch: 14 },
         { wch: 10 }, { wch: 10 }, { wch: 10 }, { wch: 10 },
-        { wch: 50 }, { wch: 30 },
+        { wch: 50 },
+        { wch: 10 }, { wch: 10 },
+        { wch: 30 },
     ];
 
     const wb = XLSX.utils.book_new();
@@ -70,7 +74,9 @@ export async function exportToXlsx(
     XLSX.writeFile(wb, fn);
 }
 
-function buildRow(s: Shape, cw: number, ch: number, imageUrl: string): Record<string, string | number> {
+function buildRow(
+    s: Shape, cw: number, ch: number, imageUrl: string,
+): Record<string, string | number> {
     if (s.kind === "rect") {
         return {
             Object_ID: s.label,
@@ -80,6 +86,8 @@ function buildRow(s: Shape, cw: number, ch: number, imageUrl: string): Record<st
             Layout_W:  round(toRelative(s.w, cw)),
             Layout_H:  round(toRelative(s.h, ch)),
             Polygon_Points: "",
+            Canvas_W:  cw,
+            Canvas_H:  ch,
             Image_URL: imageUrl,
         };
     }
@@ -99,6 +107,8 @@ function buildRow(s: Shape, cw: number, ch: number, imageUrl: string): Record<st
         Layout_W:  round(toRelative(maxX - minX, cw)),
         Layout_H:  round(toRelative(maxY - minY, ch)),
         Polygon_Points: pts,
+        Canvas_W:  cw,
+        Canvas_H:  ch,
         Image_URL: imageUrl,
     };
 }
