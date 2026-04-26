@@ -58,6 +58,12 @@ export class Canvas {
     // Interaction state
     private drag: DragState | null = null;
     private polygonPoints: { x: number; y: number }[] = [];
+    // Track last polygon click time for manual double-click detection.
+    // The native 'dblclick' event is unreliable on SVG (depends on target,
+    // bubbling, and browser-specific quirks). Comparing timestamps in our
+    // own mousedown handler is the most robust solution.
+    private lastPolygonClickAt = 0;
+    private readonly DBL_CLICK_MS = 350;
 
     // Notifications for the parent editor
     private onZoomChange: ((zoom: number) => void) | null = null;
@@ -134,6 +140,7 @@ export class Canvas {
 
     public cancelPolygon(): void {
         this.polygonPoints = [];
+        this.lastPolygonClickAt = 0;
         this.drag = null;
         this.renderOverlay();
     }
@@ -143,6 +150,7 @@ export class Canvas {
             this.shapes.addPolygon(this.polygonPoints);
         }
         this.polygonPoints = [];
+        this.lastPolygonClickAt = 0;
         this.drag = null;
         this.renderOverlay();
     }
@@ -356,14 +364,53 @@ export class Canvas {
             line.setAttribute("stroke-dasharray", `${4/this.zoom},${3/this.zoom}`);
             this.overlayLayer.appendChild(line);
         }
-        // Dots at placed points
-        for (const p of this.polygonPoints) {
+        // Closing-line preview: dashed line back to the first point so the user
+        // can see the polygon's closing edge while placing points
+        if (this.polygonPoints.length >= 2) {
+            const first = this.polygonPoints[0];
+            const last  = this.polygonPoints[this.polygonPoints.length - 1];
+            const closing = document.createElementNS(SVG_NS, "line");
+            closing.setAttribute("x1", String(last.x));
+            closing.setAttribute("y1", String(last.y));
+            closing.setAttribute("x2", String(first.x));
+            closing.setAttribute("y2", String(first.y));
+            closing.setAttribute("stroke", "#00e5a0");
+            closing.setAttribute("stroke-width", String(1.2 / this.zoom));
+            closing.setAttribute("stroke-dasharray", `${2/this.zoom},${4/this.zoom}`);
+            closing.setAttribute("opacity", "0.5");
+            this.overlayLayer.appendChild(closing);
+        }
+        // Vertex dots — first one is bigger (anchor / closing target)
+        this.polygonPoints.forEach((p, i) => {
+            const isFirst = i === 0;
             const dot = document.createElementNS(SVG_NS, "circle");
             dot.setAttribute("cx", String(p.x));
             dot.setAttribute("cy", String(p.y));
-            dot.setAttribute("r", String(4 / this.zoom));
-            dot.setAttribute("fill", "#00e5a0");
+            dot.setAttribute("r", String((isFirst ? 6 : 4) / this.zoom));
+            dot.setAttribute("fill", isFirst ? "#fff" : "#00e5a0");
+            dot.setAttribute("stroke", "#00e5a0");
+            dot.setAttribute("stroke-width", String((isFirst ? 2 : 1) / this.zoom));
             this.overlayLayer.appendChild(dot);
+        });
+        // Hint text near the first point — only shown when there are enough
+        // points to close (≥2 placed; double-click adds the third and closes)
+        if (this.polygonPoints.length >= 2) {
+            const first = this.polygonPoints[0];
+            const hint = document.createElementNS(SVG_NS, "text");
+            hint.setAttribute("x", String(first.x + 12 / this.zoom));
+            hint.setAttribute("y", String(first.y - 8 / this.zoom));
+            hint.setAttribute("fill", "#00e5a0");
+            hint.setAttribute("font-size", String(11 / this.zoom));
+            hint.setAttribute("font-family", "'Segoe UI', sans-serif");
+            hint.setAttribute("font-weight", "600");
+            hint.setAttribute("paint-order", "stroke");
+            hint.setAttribute("stroke", "#0a0e13");
+            hint.setAttribute("stroke-width", String(3 / this.zoom));
+            hint.setAttribute("stroke-linejoin", "round");
+            hint.style.pointerEvents = "none";
+            hint.style.userSelect = "none";
+            hint.textContent = "Double-click to close";
+            this.overlayLayer.appendChild(hint);
         }
     }
 
@@ -428,7 +475,26 @@ export class Canvas {
         const clickedShapeId = shapeNode?.getAttribute("data-shape-id") ?? null;
 
         if (tool === "polygon") {
-            // Place a vertex; double-click closes the polygon
+            // Manual double-click detection: if this click comes within
+            // DBL_CLICK_MS of the previous one and we already have ≥2 points
+            // (so closing makes a valid triangle or larger), close the polygon
+            // instead of adding another vertex.
+            const now = e.timeStamp || Date.now();
+            const isDoubleClick = (now - this.lastPolygonClickAt) < this.DBL_CLICK_MS
+                                  && this.polygonPoints.length >= 2;
+            this.lastPolygonClickAt = now;
+
+            if (isDoubleClick) {
+                // Don't add a new vertex; close with what we have.
+                // commitPolygon() needs at least 3 points — at this stage we
+                // already have ≥2 placed plus the one from the first click of
+                // this double-click pair (which was added on the previous
+                // mousedown). Total ≥3.
+                this.commitPolygon();
+                return;
+            }
+
+            // First click (or single click): add a vertex.
             this.polygonPoints.push({
                 x: snap(pt.x, SNAP_STEP, this.getSnap()),
                 y: snap(pt.y, SNAP_STEP, this.getSnap()),
@@ -557,7 +623,10 @@ export class Canvas {
     }
 
     private onDoubleClick(e: MouseEvent): void {
-        // In polygon mode, double-click closes the polygon
+        // Backup polygon close path. The primary close mechanism is the
+        // manual double-click detection in onMouseDown (timestamp-based).
+        // This native dblclick handler is kept as a fallback for cases
+        // where the browser does fire it reliably.
         if (this.getTool() === "polygon" && this.polygonPoints.length >= 3) {
             e.preventDefault();
             this.commitPolygon();
