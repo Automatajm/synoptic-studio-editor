@@ -3,6 +3,7 @@ import type {
 } from "./types";
 import { ShapeManager } from "./ShapeManager";
 import { snap } from "../lib/coordinates";
+import { computeCentroid } from "../lib/centroid";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const MIN_RECT_SIZE = 5;       // smallest rect we'll keep — anything tinier is treated as a click
@@ -12,7 +13,7 @@ const SNAP_STEP     = 10;       // canvas units per snap step
 type ResizeHandle = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
 
 interface DragState {
-    kind: "create-rect" | "move" | "resize" | "pan" | "polygon-build";
+    kind: "create-rect" | "move" | "resize" | "pan" | "polygon-build" | "centroid-move";
     startX:    number;             // mouse start in canvas coords (or screen for pan)
     startY:    number;
     handle?:   ResizeHandle;
@@ -273,14 +274,10 @@ export class Canvas {
     }
 
     private shapeCenter(s: Shape): { x: number; y: number } {
-        if (s.kind === "rect") {
-            return { x: s.x + s.w / 2, y: s.y + s.h / 2 };
-        }
-        // Polygon centroid (simple average — good enough for label placement)
-        let cx = 0, cy = 0;
-        for (const p of s.points) { cx += p.x; cy += p.y; }
-        const n = Math.max(1, s.points.length);
-        return { x: cx / n, y: cy / n };
+        // Single source of truth for label / anchor placement.
+        // Uses the proper area-weighted geometric centroid for polygons,
+        // and honors manual centroidOverride if set.
+        return computeCentroid(s);
     }
 
     // ── Rendering: overlay (handles, rubber band, polygon preview) ──────
@@ -298,6 +295,11 @@ export class Canvas {
         // Selection handles for selected polygon (vertex points)
         if (sel && sel.kind === "polygon" && this.getTool() === "select") {
             this.renderPolygonHandles(sel);
+        }
+
+        // Centroid anchor — visible only on the selected shape, drag to override.
+        if (sel && this.getTool() === "select") {
+            this.renderCentroidAnchor(sel);
         }
 
         // Polygon-in-progress preview
@@ -350,6 +352,71 @@ export class Canvas {
             this.overlayLayer.appendChild(handle);
         });
     }
+
+    /**
+     * Render the centroid anchor — a visible marker showing where labels
+     * (and downstream graph nodes) will be placed. The user can drag it
+     * to override the geometric centroid; right-click resets it.
+     *
+     * Visual design: filled white circle with a smaller colored core, and
+     * a subtle ring that signals "draggable handle, not a vertex". The
+     * appearance differs slightly from polygon vertex handles (which are
+     * solid green dots) so users can tell them apart.
+     */
+    private renderCentroidAnchor(s: Shape): void {
+        const c = computeCentroid(s);
+        const isOverridden = !!s.centroidOverride;
+        const r = 6 / this.zoom;
+
+        // Halo / ring — gives a soft glow for visibility on busy backgrounds
+        const halo = document.createElementNS(SVG_NS, "circle");
+        halo.setAttribute("cx", String(c.x));
+        halo.setAttribute("cy", String(c.y));
+        halo.setAttribute("r",  String(r * 1.7));
+        halo.setAttribute("fill", "none");
+        halo.setAttribute("stroke", isOverridden ? "#ffd84d" : "#00e5a0");
+        halo.setAttribute("stroke-width", String(1.4 / this.zoom));
+        halo.setAttribute("stroke-opacity", "0.55");
+        halo.style.pointerEvents = "none";
+        this.overlayLayer.appendChild(halo);
+
+        // Outer white disc (visible against any background)
+        const outer = document.createElementNS(SVG_NS, "circle");
+        outer.setAttribute("cx", String(c.x));
+        outer.setAttribute("cy", String(c.y));
+        outer.setAttribute("r",  String(r));
+        outer.setAttribute("fill", "#fff");
+        outer.setAttribute("stroke", isOverridden ? "#ffd84d" : "#00e5a0");
+        outer.setAttribute("stroke-width", String(2 / this.zoom));
+        outer.setAttribute("data-centroid", "1");
+        outer.setAttribute("data-shape-id", s.id);
+        outer.style.cursor = "move";
+        this.overlayLayer.appendChild(outer);
+
+        // Crosshair — a small + marks the exact centroid pixel.
+        // Two lines, fully decorative; shape-id on the parent disc handles the drag.
+        const arm = r * 0.55;
+        const hLine = document.createElementNS(SVG_NS, "line");
+        hLine.setAttribute("x1", String(c.x - arm));
+        hLine.setAttribute("y1", String(c.y));
+        hLine.setAttribute("x2", String(c.x + arm));
+        hLine.setAttribute("y2", String(c.y));
+        hLine.setAttribute("stroke", isOverridden ? "#ffd84d" : "#00e5a0");
+        hLine.setAttribute("stroke-width", String(1.2 / this.zoom));
+        hLine.style.pointerEvents = "none";
+        this.overlayLayer.appendChild(hLine);
+
+        const vLine = document.createElementNS(SVG_NS, "line");
+        vLine.setAttribute("x1", String(c.x));
+        vLine.setAttribute("y1", String(c.y - arm));
+        vLine.setAttribute("x2", String(c.x));
+        vLine.setAttribute("y2", String(c.y + arm));
+        vLine.setAttribute("stroke", isOverridden ? "#ffd84d" : "#00e5a0");
+        vLine.setAttribute("stroke-width", String(1.2 / this.zoom));
+        vLine.style.pointerEvents = "none";
+        this.overlayLayer.appendChild(vLine);
+    }
+
 
     private renderPolygonInProgress(): void {
         if (this.polygonPoints.length === 0) return;
@@ -452,6 +519,22 @@ export class Canvas {
         const target = e.target as Element;
         const tool   = this.getTool();
         const pt     = this.screenToCanvas(e.clientX, e.clientY);
+
+        // Check if clicking the centroid anchor (overlay handle).
+        // The dot is rendered for the selected shape; clicking it begins a
+        // drag that updates the shape's centroidOverride live.
+        if (target.getAttribute && target.getAttribute("data-centroid") === "1") {
+            const sid = target.getAttribute("data-shape-id");
+            if (sid) {
+                this.drag = {
+                    kind: "centroid-move",
+                    startX: pt.x, startY: pt.y,
+                    shapeId: sid,
+                };
+                e.stopPropagation();
+                return;
+            }
+        }
 
         // Check if clicking a resize handle
         const handle = target.getAttribute("data-handle") as ResizeHandle | null;
@@ -586,6 +669,16 @@ export class Canvas {
             this.shapes.updateRect(orig.id, next);
             return;
         }
+
+        if (this.drag.kind === "centroid-move" && this.drag.shapeId) {
+            // Update the shape's centroidOverride to the current mouse position.
+            // No snap — the centroid should land precisely where the user wants.
+            // We allow it to be placed anywhere (even outside the shape) — the
+            // user knows what they're doing, and there are valid reasons (e.g.
+            // labelling a tiny shape with the dot floating above it for clarity).
+            this.shapes.setCentroidOverride(this.drag.shapeId, { x: pt.x, y: pt.y });
+            return;
+        }
     }
 
     private onMouseUp(_e: MouseEvent): void {
@@ -634,8 +727,21 @@ export class Canvas {
     }
 
     private onContextMenu(e: MouseEvent): void {
-        // Right-click on a shape removes it
         const target = e.target as Element;
+
+        // Right-click on the centroid anchor → reset to geometric centroid.
+        // Takes priority over shape-deletion since the dot sits on top of the
+        // shape and the user's intent is clearly "reset this anchor".
+        if (target.getAttribute && target.getAttribute("data-centroid") === "1") {
+            const sid = target.getAttribute("data-shape-id");
+            if (sid) {
+                e.preventDefault();
+                this.shapes.setCentroidOverride(sid, null);
+                return;
+            }
+        }
+
+        // Right-click on a shape removes it
         const node   = this.findShapeNode(target);
         const id     = node?.getAttribute("data-shape-id");
         if (id) {
@@ -654,7 +760,8 @@ export class Canvas {
         while (cur && cur !== this.svg) {
             if (cur.getAttribute && cur.getAttribute("data-shape-id")
                 && !cur.getAttribute("data-handle")
-                && !cur.getAttribute("data-vertex-idx")) {
+                && !cur.getAttribute("data-vertex-idx")
+                && cur.getAttribute("data-centroid") !== "1") {
                 return cur;
             }
             cur = cur.parentElement;

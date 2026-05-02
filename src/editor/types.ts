@@ -15,6 +15,12 @@ export interface Rect {
     y:     number;          // top-left corner Y in canvas coords
     w:     number;          // width in canvas coords
     h:     number;          // height in canvas coords
+    // Optional manual override of the centroid (label anchor + downstream
+    // graph node position). When absent, the geometric centroid is used —
+    // for rects, that's simply (x + w/2, y + h/2). The override lets users
+    // relocate the anchor when the geometric center falls in an awkward
+    // place for a particular shape.
+    centroidOverride?: Point;
 }
 
 export interface Polygon {
@@ -22,6 +28,10 @@ export interface Polygon {
     id:    string;
     label: string;
     points: Point[];        // ordered vertices
+    // Optional manual override of the centroid. When absent, computeCentroid()
+    // returns the area-weighted geometric centroid, which lands inside the
+    // polygon for any simple shape (including L, T, U, irregular, etc.).
+    centroidOverride?: Point;
 }
 
 export type Shape = Rect | Polygon;

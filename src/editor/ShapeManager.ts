@@ -92,6 +92,21 @@ export class ShapeManager {
         this.notify();
     }
 
+    /**
+     * Set or clear the manual centroid override for a shape.
+     * Pass null to clear (revert to geometric centroid).
+     */
+    setCentroidOverride(id: string, override: Point | null): void {
+        const s = this.getById(id);
+        if (!s) return;
+        if (override === null) {
+            delete s.centroidOverride;
+        } else {
+            s.centroidOverride = { x: override.x, y: override.y };
+        }
+        this.notify();
+    }
+
     // ── Delete ──────────────────────────────────────────────────────────
     remove(id: string): void {
         const idx = this.shapes.findIndex(s => s.id === id);
