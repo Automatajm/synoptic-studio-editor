@@ -38,11 +38,17 @@ export type Shape = Rect | Polygon;
 
 export type ToolMode = "select" | "rect" | "polygon";
 
+export type ImageMode = "embed" | "url";
+
 export interface BackgroundImage {
-    src:    string;          // data URL or external URL
+    src:    string;          // data URL (when mode='embed') or external URL (when mode='url')
     width:  number;          // natural pixel width
     height: number;          // natural pixel height
     name:   string;          // file name (for export reference)
+    mode:   ImageMode;       // 'embed' = base64 data URI, 'url' = external link
+    // For embed mode: the size of the base64 string after compression.
+    // Used to warn the user if the image is too large for an Excel cell.
+    embedSize?: number;
 }
 
 export interface EditorState {

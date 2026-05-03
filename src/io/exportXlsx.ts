@@ -19,12 +19,16 @@ import { computeCentroid } from "../lib/centroid";
  *   Honors manual centroidOverride; falls back to the geometric centroid.
  *   These are usable downstream as graph node positions for routing,
  *   clustering, nearest-neighbor analysis, etc.
- * - Image_URL is filled on every row when provided (denormalized for easier
- *   handling in Power BI's data model).
+ * - Image_URL is written ONLY in the first row (after alphabetical sort).
+ *   This is critical when the URL is a base64 data URI — embedded images
+ *   can be 30,000+ chars, and replicating that across 100+ rows would
+ *   bloat the .xlsx file unnecessarily. The Power BI visual reads the
+ *   first non-empty Image_URL value across the dataset, so a single row
+ *   is sufficient.
  */
 
 export interface ExportOptions {
-    imageUrl?: string;        // optional URL to embed as a column
+    imageUrl?: string;        // optional URL or data URI to embed in row 0
 }
 
 export async function exportToXlsx(
@@ -34,10 +38,21 @@ export async function exportToXlsx(
     bg: BackgroundImage | null,
     opts: ExportOptions = {},
 ): Promise<void> {
-    const rows = shapes.map(s => buildRow(s, canvasW, canvasH, opts.imageUrl ?? ""));
+    // Build rows WITHOUT image URL — it gets injected into the first row only
+    // after we sort, so the carrier row is deterministic (always the first
+    // alphabetical Object_ID).
+    const rows = shapes.map(s => buildRow(s, canvasW, canvasH));
 
     // Sort rows by Object_ID alphabetically for a tidy output
     rows.sort((a, b) => String(a.Object_ID).localeCompare(String(b.Object_ID)));
+
+    // Inject the image URL/data URI into the FIRST row only (if present).
+    // The Power BI visual scans for the first non-empty Image_URL value,
+    // so a single carrier row is sufficient. This keeps the file small
+    // even when the image is base64-embedded (which can be 30K+ chars).
+    if (opts.imageUrl && rows.length > 0) {
+        rows[0].Image_URL = opts.imageUrl;
+    }
 
     const ws = XLSX.utils.json_to_sheet(rows, {
         header: [
@@ -62,13 +77,19 @@ export async function exportToXlsx(
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Layouts");
 
-    // Add a metadata sheet so the user remembers the canvas size used
+    // Add a metadata sheet so the user remembers the canvas size used.
+    // For embed mode, we record the size in chars so the user knows the
+    // approximate weight of the carrier row.
+    const isEmbed = bg?.mode === "embed";
     const meta = XLSX.utils.aoa_to_sheet([
         ["Field", "Value"],
         ["Canvas Width (px)",  canvasW],
         ["Canvas Height (px)", canvasH],
         ["Background image",   bg?.name ?? ""],
-        ["Image URL",          opts.imageUrl ?? ""],
+        ["Image mode",         bg?.mode ?? ""],
+        ["Image (carrier row)", isEmbed
+            ? `[base64 embedded, ~${Math.round((bg?.embedSize ?? 0) / 1024)} KB]`
+            : (opts.imageUrl ?? "")],
         ["Coordinates",        "Relative (0-100% of canvas)"],
         ["Total objects",      shapes.length],
         ["Generated",          new Date().toISOString()],
@@ -83,7 +104,7 @@ export async function exportToXlsx(
 }
 
 function buildRow(
-    s: Shape, cw: number, ch: number, imageUrl: string,
+    s: Shape, cw: number, ch: number,
 ): Record<string, string | number> {
     // Centroid: respects manual override; otherwise area-weighted geometric.
     const c = computeCentroid(s);
@@ -103,7 +124,7 @@ function buildRow(
             Centroid_Y: centroidY,
             Canvas_W:  cw,
             Canvas_H:  ch,
-            Image_URL: imageUrl,
+            Image_URL: "",
         };
     }
     // Polygon — also compute bounding box so older visuals can still place it
@@ -126,6 +147,6 @@ function buildRow(
         Centroid_Y: centroidY,
         Canvas_W:  cw,
         Canvas_H:  ch,
-        Image_URL: imageUrl,
+        Image_URL: "",
     };
 }

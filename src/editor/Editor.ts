@@ -5,6 +5,8 @@ import { Canvas } from "./Canvas";
 import { Toolbar } from "../ui/Toolbar";
 import { Sidebar } from "../ui/Sidebar";
 import { exportToXlsx } from "../io/exportXlsx";
+import { askImageSource, askForUrl } from "../ui/ImageSourceModal";
+import { imageFileToDataUri, probeImageUrl } from "../lib/image";
 
 /**
  * Editor — top-level controller.
@@ -86,43 +88,90 @@ export class Editor {
     }
 
     // ── Image loading ───────────────────────────────────────────────────
-    private loadImageDialog(): void {
-        const input = document.createElement("input");
-        input.type = "file";
-        input.accept = "image/*";
-        input.style.display = "none";
-        input.addEventListener("change", () => {
-            const file = input.files?.[0];
-            if (file) this.loadImageFile(file);
-        });
-        document.body.appendChild(input);
-        input.click();
-        document.body.removeChild(input);
+    /**
+     * Two-step flow for adding a background image:
+     *   1. Ask the user how they want to attach it (embed vs external URL).
+     *   2. Open the appropriate input (file picker or URL prompt) and
+     *      process the result.
+     * Either step can be cancelled — the editor state is only updated when
+     * a valid image is fully loaded.
+     */
+    private async loadImageDialog(): Promise<void> {
+        const choice = await askImageSource();
+        if (choice === "cancel") return;
+        if (choice === "embed") {
+            await this.openFilePickerForEmbed();
+        } else {
+            await this.openUrlPromptForExternal();
+        }
     }
 
-    private loadImageFile(file: File): void {
-        const reader = new FileReader();
-        reader.onload = () => {
-            const dataUrl = reader.result as string;
-            const img = new Image();
-            img.onload = () => {
-                this.bg = {
-                    src:    dataUrl,
-                    width:  img.naturalWidth,
-                    height: img.naturalHeight,
-                    name:   file.name,
-                };
-                // Resize canvas to match image natural dimensions for pixel-perfect
-                // alignment of shapes against the picture.
-                this.canvasW = img.naturalWidth;
-                this.canvasH = img.naturalHeight;
-                this.toolbar.setHasImage(true);
-                this.canvas.render();
-                this.canvas.fitToViewport();
+    private openFilePickerForEmbed(): Promise<void> {
+        return new Promise((resolve) => {
+            const input = document.createElement("input");
+            input.type = "file";
+            input.accept = "image/*";
+            input.style.display = "none";
+            input.addEventListener("change", async () => {
+                const file = input.files?.[0];
+                if (file) await this.processEmbedFile(file);
+                document.body.removeChild(input);
+                resolve();
+            });
+            document.body.appendChild(input);
+            input.click();
+        });
+    }
+
+    private async processEmbedFile(file: File): Promise<void> {
+        try {
+            const result = await imageFileToDataUri(file);
+            if (result.tooLarge) {
+                const proceed = confirm(
+                    "This image is large (" + Math.round(result.sizeChars / 1024) + " KB after compression).\n\n" +
+                    "It exceeds the recommended Excel cell limit. The export may not work correctly.\n\n" +
+                    "Continue anyway, or cancel and try a smaller image / external URL?",
+                );
+                if (!proceed) return;
+            }
+            this.bg = {
+                src:       result.dataUri,
+                width:     result.width,
+                height:    result.height,
+                name:      file.name,
+                mode:      "embed",
+                embedSize: result.sizeChars,
             };
-            img.src = dataUrl;
+            this.canvasW = result.width;
+            this.canvasH = result.height;
+            this.toolbar.setHasImage(true);
+            this.canvas.render();
+            this.canvas.fitToViewport();
+        } catch (err) {
+            alert("Failed to process image: " + (err instanceof Error ? err.message : String(err)));
+        }
+    }
+
+    private async openUrlPromptForExternal(): Promise<void> {
+        const url = await askForUrl();
+        if (!url) return;
+        const probe = await probeImageUrl(url);
+        if (!probe.ok) {
+            alert("Couldn't load that URL: " + probe.reason);
+            return;
+        }
+        this.bg = {
+            src:    url,
+            width:  probe.width,
+            height: probe.height,
+            name:   url.split("/").pop() || "remote-image",
+            mode:   "url",
         };
-        reader.readAsDataURL(file);
+        this.canvasW = probe.width;
+        this.canvasH = probe.height;
+        this.toolbar.setHasImage(true);
+        this.canvas.render();
+        this.canvas.fitToViewport();
     }
 
     private clearImage(): void {
@@ -141,16 +190,13 @@ export class Editor {
             alert("No shapes to export. Draw at least one shape first.");
             return;
         }
-        // Ask for image URL only if a background is loaded
-        let imageUrl: string | undefined = undefined;
-        if (this.bg) {
-            const answer = prompt(
-                "Optional: paste a public image URL to include in the export. " +
-                "Leave blank to export coordinates only.",
-                "",
-            );
-            if (answer && answer.trim().length > 0) imageUrl = answer.trim();
-        }
+        // The image source (embed data URI or external URL) is set when the
+        // user loaded the image — no need to prompt again at export time.
+        // For embed mode, the data URI lives in bg.src; for URL mode, the URL.
+        // The exportXlsx writer puts it in the FIRST row's Image_URL only,
+        // leaving subsequent rows empty so the file stays compact even for
+        // large embedded images. The visual reads the first non-empty value.
+        const imageUrl = this.bg ? this.bg.src : undefined;
         try {
             await exportToXlsx(shapes, this.canvasW, this.canvasH, this.bg, { imageUrl });
         } catch (err) {
