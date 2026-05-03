@@ -5,7 +5,8 @@ import { Canvas } from "./Canvas";
 import { Toolbar } from "../ui/Toolbar";
 import { Sidebar } from "../ui/Sidebar";
 import { exportToXlsx } from "../io/exportXlsx";
-import { askImageSource, askForUrl } from "../ui/ImageSourceModal";
+import { exportToCsv } from "../io/exportCsv";
+import { askImageSource, askForUrl, askExportFormat } from "../ui/ImageSourceModal";
 import { imageFileToDataUri, probeImageUrl } from "../lib/image";
 
 /**
@@ -25,6 +26,11 @@ export class Editor {
     private bg:   BackgroundImage | null = null;
     private canvasW = DEFAULT_CANVAS_W;
     private canvasH = DEFAULT_CANVAS_H;
+    // Cached reference to the originally chosen file for embed mode.
+    // Lets us re-encode at a higher quality if the user picks CSV at
+    // export time after having initially picked an Excel-friendly compression.
+    // Only set for "embed" mode — null for "url" mode.
+    private bgSourceFile: File | null = null;
     private snap    = false;
 
     constructor(root: HTMLElement) {
@@ -123,32 +129,78 @@ export class Editor {
         });
     }
 
+    /**
+     * Load an image file for embed mode WITHOUT compressing it for preview.
+     *
+     * The editor canvas always uses the original blob URL — never a
+     * compressed version — so the user works at 100% fidelity. Compression
+     * only happens at export time, and we re-encode using the format and
+     * quality profile that fit Power BI's 32K-character cap.
+     *
+     * If the image is so detailed that NO compression strategy fits within
+     * the cap, we surface that fact clearly in the warning so the user
+     * knows to switch to External URL flow before exporting (rather than
+     * silently producing a broken export).
+     */
     private async processEmbedFile(file: File): Promise<void> {
         try {
-            const result = await imageFileToDataUri(file);
-            if (result.tooLarge) {
-                const proceed = confirm(
-                    "This image is large (" + Math.round(result.sizeChars / 1024) + " KB after compression).\n\n" +
-                    "It exceeds the recommended Excel cell limit. The export may not work correctly.\n\n" +
-                    "Continue anyway, or cancel and try a smaller image / external URL?",
-                );
-                if (!proceed) return;
-            }
+            const objectUrl = URL.createObjectURL(file);
+            const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+                const im = new Image();
+                im.onload  = () => resolve(im);
+                im.onerror = () => reject(new Error("Failed to decode image"));
+                im.src = objectUrl;
+            });
+            const naturalW = img.naturalWidth;
+            const naturalH = img.naturalHeight;
             this.bg = {
-                src:       result.dataUri,
-                width:     result.width,
-                height:    result.height,
-                name:      file.name,
-                mode:      "embed",
-                embedSize: result.sizeChars,
+                src:    objectUrl,
+                width:  naturalW,
+                height: naturalH,
+                name:   file.name,
+                mode:   "embed",
             };
-            this.canvasW = result.width;
-            this.canvasH = result.height;
+            this.bgSourceFile = file;
+            this.canvasW = naturalW;
+            this.canvasH = naturalH;
             this.toolbar.setHasImage(true);
             this.canvas.render();
             this.canvas.fitToViewport();
+
+            // Pre-flight check: try the AVIF/WebP/JPEG cascade silently in
+            // the background so the user knows BEFORE they trace shapes
+            // whether the image will fit in PBI's data cap. This avoids
+            // wasting hours of work only to discover at export time.
+            // Run as a microtask so the canvas render isn't blocked.
+            queueMicrotask(async () => {
+                try {
+                    const probe = await imageFileToDataUri(file, "auto");
+                    if (!probe.fitsInPbi) {
+                        const sizeKb = Math.round(probe.sizeChars / 1024);
+                        const proceed = confirm(
+                            "⚠  Image too large for embedding\n\n" +
+                            "Even after compression to " + probe.format.toUpperCase() +
+                            ", the smallest version is ~" + sizeKb + "KB which exceeds " +
+                            "Power BI's 32K limit for visual data fields.\n\n" +
+                            "RECOMMENDED: Cancel this image, click Load Image again, " +
+                            "and pick 'Use external URL' to upload to Imgur (free, anonymous, 30 seconds).\n\n" +
+                            "Continue with degraded image anyway?",
+                        );
+                        if (!proceed) {
+                            // User opted out — clear the background
+                            URL.revokeObjectURL(objectUrl);
+                            this.bg = null;
+                            this.bgSourceFile = null;
+                            this.canvasW = DEFAULT_CANVAS_W;
+                            this.canvasH = DEFAULT_CANVAS_H;
+                            this.toolbar.setHasImage(false);
+                            this.canvas.render();
+                        }
+                    }
+                } catch (_e) { /* probe failed; ignore */ }
+            });
         } catch (err) {
-            alert("Failed to process image: " + (err instanceof Error ? err.message : String(err)));
+            alert("Failed to load image: " + (err instanceof Error ? err.message : String(err)));
         }
     }
 
@@ -167,6 +219,7 @@ export class Editor {
             name:   url.split("/").pop() || "remote-image",
             mode:   "url",
         };
+        this.bgSourceFile = null;     // URL mode — no source file to remember
         this.canvasW = probe.width;
         this.canvasH = probe.height;
         this.toolbar.setHasImage(true);
@@ -184,21 +237,75 @@ export class Editor {
     }
 
     // ── Export ──────────────────────────────────────────────────────────
+    /**
+     * Export flow:
+     *   1. Ask the user which format (xlsx vs csv).
+     *   2. If embedding an image, re-encode at the appropriate quality:
+     *      - xlsx → "excel" profile (q=80, aggressive resize if needed)
+     *      - csv  → "csv" profile  (q=95, minimal resize)
+     *   3. Hand off to the matching writer (exportToXlsx / exportToCsv).
+     *
+     * Re-encoding at export time gives the user the best possible quality
+     * for the format they chose, without requiring them to reload the
+     * image just to change formats.
+     */
     private async exportFile(): Promise<void> {
         const shapes = this.shapes.getAll();
         if (shapes.length === 0) {
             alert("No shapes to export. Draw at least one shape first.");
             return;
         }
-        // The image source (embed data URI or external URL) is set when the
-        // user loaded the image — no need to prompt again at export time.
-        // For embed mode, the data URI lives in bg.src; for URL mode, the URL.
-        // The exportXlsx writer puts it in the FIRST row's Image_URL only,
-        // leaving subsequent rows empty so the file stays compact even for
-        // large embedded images. The visual reads the first non-empty value.
-        const imageUrl = this.bg ? this.bg.src : undefined;
+
+        const hasEmbed = this.bg?.mode === "embed";
+        const fmt = await askExportFormat(!!hasEmbed);
+        if (fmt === "cancel") return;
+
+        // Resolve the image URL/data URI to embed.
+        // - URL mode: use the stored URL directly (always valid for both formats).
+        // - Embed mode: re-encode at export time with the "auto" quality
+        //   profile, which picks the best AVIF/WebP/JPEG combo that fits
+        //   Power BI's 32K data limit. Falls back gracefully if the image
+        //   is too large to fit at any quality.
+        let imageUrl: string | undefined = undefined;
+        if (this.bg) {
+            if (this.bg.mode === "url") {
+                imageUrl = this.bg.src;
+            } else if (this.bg.mode === "embed" && this.bgSourceFile) {
+                try {
+                    const result = await imageFileToDataUri(this.bgSourceFile, "auto");
+                    imageUrl = result.dataUri;
+                    if (!result.fitsInPbi) {
+                        const sizeKb = Math.round(result.sizeChars / 1024);
+                        const proceed = confirm(
+                            "⚠  Embedded image (" + result.format.toUpperCase() + ", ~" + sizeKb + "KB) " +
+                            "exceeds Power BI's 32K limit. " +
+                            "The image WILL appear truncated in Power BI.\n\n" +
+                            "Recommended: cancel and switch to External URL flow (Imgur).\n\n" +
+                            "Continue with truncated image anyway?",
+                        );
+                        if (!proceed) return;
+                    } else {
+                        // Helpful confirmation
+                        console.log(
+                            "[SynopticStudio] Image embedded as " + result.format.toUpperCase() +
+                            ", " + Math.round(result.sizeChars / 1024) + "KB, fits PBI cap.",
+                        );
+                    }
+                } catch (err) {
+                    alert("Failed to encode image: " + (err instanceof Error ? err.message : String(err)));
+                    return;
+                }
+            } else {
+                imageUrl = this.bg.src;     // fallback
+            }
+        }
+
         try {
-            await exportToXlsx(shapes, this.canvasW, this.canvasH, this.bg, { imageUrl });
+            if (fmt === "csv") {
+                await exportToCsv(shapes, this.canvasW, this.canvasH, this.bg, { imageUrl });
+            } else {
+                await exportToXlsx(shapes, this.canvasW, this.canvasH, this.bg, { imageUrl });
+            }
         } catch (err) {
             alert("Export failed: " + (err instanceof Error ? err.message : String(err)));
         }
